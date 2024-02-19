@@ -1,10 +1,10 @@
 // Check when to flush the sended data if no one awaits the future
 
-use std::{pin::Pin, task::{Context, Poll}, time::Duration, time::Instant};
+use std::{pin::Pin, task::{Context, Poll}, time::Duration, time::Instant, collections::VecDeque};
 use anyhow::Result;
 use tokio::{task, net::{TcpListener, TcpStream, tcp}, io::{BufReader, AsyncBufReadExt, BufWriter}, time::{sleep}};
 use tokio_stream::wrappers::LinesStream;
-use futures::{ready, Stream, Sink, StreamExt, SinkExt, AsyncWriteExt, io::IntoSink};
+use futures::{Stream, Sink, StreamExt, SinkExt, AsyncWriteExt, io::IntoSink};
 use async_compat::Compat;
 use serde_json::{Value, json};
 use serde::{Serialize, Deserialize};
@@ -33,21 +33,13 @@ async fn json_protocol_server() -> Result<()> {
 }
 
 async fn json_protocol_client() -> Result<()> {
-    sleep(Duration::from_secs(2)).await;
     let stream = TcpStream::connect("127.0.0.1:8080").await?;
     let mut protocol = HeartbeatProtocol::new(stream, "Client");
-    // next を必須にしないためには poll_ready, poll_flush でもプロトコルの下位スタックに poll_next を呼ぶ必要がある
-    // packet の queue を用意して
-    loop {
-        tokio::select! {
-            value = protocol.next() => {
-                unreachable!("Client only needs to be receiving for heartbeat mechanism, but received: {:?}", value);
-            },
-            _ = sleep(Duration::from_secs(1)) => {
-                protocol.send(json!({"message": "Hello"})).await?;
-            },
-        }
-    };
+    for _ in 0..10 {
+        sleep(Duration::from_secs(1)).await;
+        protocol.send(json!({"message": "Hello"})).await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,8 +57,10 @@ enum HeartbeatPacketKind {
 
 struct HeartbeatProtocol {
     json_protocol: JsonProtocol,
+    json_protocol_finished: bool,
     ping_stage: HeartbeatPingStage,
     pong_stage: HeartbeatPongStage,
+    pending_values: VecDeque<Value>,
     role: String,
 }
 
@@ -91,8 +85,10 @@ impl HeartbeatProtocol {
         let json_protocol = JsonProtocol::new(stream);
         Self {
             json_protocol,
+            json_protocol_finished: false,
             ping_stage: HeartbeatPingStage::WaitingUntil(Instant::now() + Duration::from_secs(5)),
             pong_stage: HeartbeatPongStage::NoNeeded,
+            pending_values: VecDeque::new(),
             role: role.into(),
         }
     }
@@ -113,6 +109,7 @@ impl HeartbeatProtocol {
                     }
                 },
                 HeartbeatPingStage::WaitingReady => {
+                    log::trace!("[{}] HeartbeatProtocol Start Ping", this.role);
                     log::trace!("[{}] HeartbeatProtocol::poll_ping: WaitingReady", this.role);
                     match json_protocol.poll_ready(cx) {
                         Poll::Ready(Ok(())) => {
@@ -148,6 +145,7 @@ impl HeartbeatProtocol {
                     log::trace!("[{}] HeartbeatProtocol::poll_ping: WaitingFlushed", this.role);
                     match json_protocol.poll_flush(cx) {
                         Poll::Ready(Ok(())) => {
+                            log::trace!("[{}] HeartbeatProtocol Sent Ping", this.role);
                             this.ping_stage = HeartbeatPingStage::WaitingUntil(Instant::now() + Duration::from_secs(5));
                             break;
                         },
@@ -174,6 +172,7 @@ impl HeartbeatProtocol {
                     return Poll::Ready(Ok(()));
                 },
                 HeartbeatPongStage::WaitingReady => {
+                    log::trace!("[{}] HeartbeatProtocol Start Pong", this.role);
                     log::trace!("[{}] HeartbeatProtocol::poll_pong: WaitingReady", this.role);
                     match json_protocol.poll_ready(cx) {
                         Poll::Ready(Ok(())) => {
@@ -209,6 +208,7 @@ impl HeartbeatProtocol {
                     log::trace!("[{}] HeartbeatProtocol::poll_pong: WaitingFlushed", this.role);
                     match json_protocol.poll_flush(cx) {
                         Poll::Ready(Ok(())) => {
+                            log::trace!("[{}] HeartbeatProtocol Sent Pong", this.role);
                             this.pong_stage = HeartbeatPongStage::NoNeeded;
                             break;
                         },
@@ -225,9 +225,49 @@ impl HeartbeatProtocol {
         return Poll::Ready(Ok(()));
     }
 
-    fn poll_protocol_backend(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
+    fn poll_next_all(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
+        let this: &mut Self = &mut *self;
+        let json_protocol: &mut _ = &mut this.json_protocol;
+
+        // Read all messages from the json_protocol
+        while !this.json_protocol_finished {
+            let json_protocol: Pin<&mut _> = Pin::new(json_protocol);
+            match json_protocol.poll_next(cx)? {
+                Poll::Ready(Some(value)) => {
+                    let packet = serde_json::from_value::<HeartbeatPacket>(value)?;
+                    match packet.kind {
+                        HeartbeatPacketKind::Ping => {
+                            log::debug!("[{}] HeartbeatProtocol Received Ping", this.role);
+                            this.pong_stage = HeartbeatPongStage::WaitingReady;
+                        },
+                        HeartbeatPacketKind::Pong => {
+                            log::debug!("[{}] HeartbeatProtocol Received Pong", this.role);
+                        },
+                        HeartbeatPacketKind::Message => {
+                            this.pending_values.push_back(packet.value);
+                        },
+                    }
+                },
+                Poll::Ready(None) => {
+                    self.json_protocol_finished = true;
+                    break;
+                },
+                Poll::Pending => {
+                    break;
+                },
+            }
+        };
+        Ok(())
+    }
+
+    fn poll_send_protocol_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
         let _ = Pin::new(&mut *self).poll_ping(cx)?;
         let _ = Pin::new(&mut *self).poll_pong(cx)?;
+        Ok(())
+    }
+
+    fn poll_receive_protocol_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Result<()> {
+        Pin::new(&mut *self).poll_next_all(cx)?;
         Ok(())
     }
 }
@@ -238,33 +278,20 @@ impl Stream for HeartbeatProtocol {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         log::trace!("[{}] HeartbeatProtocol::poll_next", self.role);
 
-        Pin::new(&mut *self).poll_protocol_backend(cx)?;
+        Pin::new(&mut *self).poll_send_protocol_message(cx)?;
+        Pin::new(&mut *self).poll_receive_protocol_message(cx)?;
+        Pin::new(&mut *self).poll_next_all(cx)?;
 
-        let this: &mut Self = &mut *self;
-        let json_protocol: &mut _ = &mut this.json_protocol;
-        let json_protocol: Pin<&mut _> = Pin::new(json_protocol);
-        let value = ready!(json_protocol.poll_next(cx)?);
-        let Some(value) = value else {
-            return Poll::Ready(None);
-        };
-        let packet = serde_json::from_value::<HeartbeatPacket>(value)?;
-        match packet.kind {
-            HeartbeatPacketKind::Ping => {
-                log::debug!("[{}] HeartbeatProtocol Received Ping", self.role);
-                self.pong_stage = HeartbeatPongStage::WaitingReady;
-                // 下位プロトコルの poll_next の ready を pending にするときは wake が必要
+        if let Some(value) = self.pending_values.pop_front() {
+            Poll::Ready(Some(Ok(value)))
+        } else {
+            if self.json_protocol_finished {
+                Poll::Ready(None)
+            } else {
+                // 下層プロトコルが Pending を返した以外の場合で Pending を返すときは wake が必須
                 cx.waker().wake_by_ref();
                 Poll::Pending
-            },
-            HeartbeatPacketKind::Pong => {
-                log::debug!("[{}] HeartbeatProtocol Received Pong", self.role);
-                // 下位プロトコルの poll_next の ready を pending にするときは wake が必要
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            },
-            HeartbeatPacketKind::Message => {
-                Poll::Ready(Some(Ok(packet.value)))
-            },
+            }
         }
     }
 }
@@ -274,6 +301,10 @@ impl Sink<Value> for HeartbeatProtocol {
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         log::trace!("[{}] HeartbeatProtocol::poll_ready", self.role);
+
+        Pin::new(&mut *self).poll_send_protocol_message(cx)?;
+        Pin::new(&mut *self).poll_receive_protocol_message(cx)?;
+
         let this: &mut Self = &mut *self;
         let json_protocol: &mut _ = &mut this.json_protocol;
         let json_protocol: Pin<&mut _> = Pin::new(json_protocol);
@@ -291,6 +322,10 @@ impl Sink<Value> for HeartbeatProtocol {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         log::trace!("[{}] HeartbeatProtocol::poll_flush", self.role);
+
+        Pin::new(&mut *self).poll_send_protocol_message(cx)?;
+        Pin::new(&mut *self).poll_receive_protocol_message(cx)?;
+
         let this: &mut Self = &mut *self;
         let json_protocol: &mut _ = &mut this.json_protocol;
         let json_protocol: Pin<&mut _> = Pin::new(json_protocol);
